@@ -82,7 +82,8 @@ def parse_facets(text: str) -> List[Dict]:
     return facets
 
 
-"""def fetch_embed_url_card(access_token: str, url: str) -> Dict:
+def fetch_embed_url_card(access_token: str, url: str) -> Dict:
+    # TODO make this work... :(
     # the required fields for every embed card
     card = {
         "uri": url,
@@ -99,14 +100,16 @@ def parse_facets(text: str) -> List[Dict]:
     title_tag = soup.find("meta", property="og:title")
     if title_tag:
         card["title"] = title_tag["content"]
+
     description_tag = soup.find("meta", property="og:description")
     if description_tag:
         card["description"] = description_tag["content"]
 
-    # if there is an "og:image" HTML meta tag, fetch and upload that image
-    image_tag = soup.find("meta", property="og:image")
+    # find the first image tag that has alt="arxiv logo"
+    image_tag = soup.find("img", alt="arxiv logo")
+    # get the src attribute of the image tag
     if image_tag:
-        img_url = image_tag["content"]
+        img_url = image_tag["src"]
         # naively turn a "relative" URL (just a path) into a full URL, if needed
         if "://" not in img_url:
             img_url = url + img_url
@@ -116,8 +119,7 @@ def parse_facets(text: str) -> List[Dict]:
         blob_resp = requests.post(
             "https://bsky.social/xrpc/com.atproto.repo.uploadBlob",
             headers={
-                "Content-Type": resp.headers["Content-Type"],  #
-                # image mimetype
+                "Content-Type": 'image/png',
                 "Authorization": "Bearer " + access_token,
             },
             data=resp.content,
@@ -128,7 +130,7 @@ def parse_facets(text: str) -> List[Dict]:
     return {
         "$type": "app.bsky.embed.external",
         "external": card,
-    }"""
+    }
 
 
 def create_post(
@@ -161,7 +163,7 @@ def create_post(
             post["facets"] = facets
 
             # add link embed according to the URL
-
+            #
             #post["embeds"] = fetch_embed_url_card(session["accessJwt"], facets[0]["features"][0]["uri"])
 
     resp = requests.post(
@@ -235,7 +237,7 @@ def main():
     for k, v in pull.items():
         if k not in archive:  # if not already posted
             post_str = (
-                    f"{v['title']}\n{v['link']}\n{''.join(v['description']).split('Abstract:')[-1].strip()}"[:297] + "\n📈🤖"
+                    f"{v['title']}\n{v['link']}\n{''.join(v['description']).split('Abstract:')[-1].strip()}"[:293] + "...📈🤖"
             )
             create_post(post_str)
             time.sleep(random.randint(60, 300))
@@ -243,7 +245,7 @@ def main():
             new_posts += 1
     if new_posts == 0 & (len(archive) > 2):
         post_str = "No new papers today! 📈🤖"
-        create_post(post_str.replace("\n", " "))
+        create_post(post_str)
 
 
 # %%
