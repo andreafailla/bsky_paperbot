@@ -148,7 +148,7 @@ def get_arxiv_feed(subject: str = "cs.si+soc-ph"):
     return res
 
 
-def get_and_write_feed_json(feedname="econ.em+stat.me", filename="combined.json"):
+def get_and_write_feed_json(feedname="cs.si+soc-ph", filename="combined.json"):
     feed = get_arxiv_feed(feedname)
     try:
         with open(filename, "r") as f:
