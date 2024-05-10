@@ -11,6 +11,7 @@ import requests
 import feedparser
 
 
+
 # %%
 def bsky_login_session(pds_url: str, handle: str, password: str) -> Dict:
     """login to blueksy
@@ -123,7 +124,7 @@ def create_post(
     resp.raise_for_status()
 
 
-def get_arxiv_feed(subject: str = "cs.si+soc-ph"):
+def get_arxiv_feed(subject: str = "cs.si+physics.soc-ph"):
     """get skeetable list of paper title, link, and (fragment of) abstract
 
     Args:
@@ -148,7 +149,7 @@ def get_arxiv_feed(subject: str = "cs.si+soc-ph"):
     return res
 
 
-def get_and_write_feed_json(feedname="cs.si+soc-ph", filename="combined.json"):
+def get_and_write_feed_json(feedname="cs.si+physics.soc-ph", filename="combined.json"):
     feed = get_arxiv_feed(feedname)
     try:
         with open(filename, "r") as f:
