@@ -1,10 +1,3 @@
-#!/home/alal/anaconda3/bin/python3
-
-"""
-Script to post new articles from arxiv stat.ME and econ.EM. Bring your own handle and app-password.
-"""
-
-# %%
 import time
 import re
 import os
@@ -88,10 +81,10 @@ def parse_facets(text: str) -> List[Dict]:
 
 
 def create_post(
-    text: str,
-    pds_url: str = "https://bsky.social",
-    handle: str = os.environ["BSKYBOT"],
-    password: str = os.environ["BSKYPWD"],
+        text: str,
+        pds_url: str = "https://bsky.social",
+        handle: str = os.environ["BSKYBOT"],
+        password: str = os.environ["BSKYPWD"],
 ):
     """post on bluesky
 
@@ -130,7 +123,7 @@ def create_post(
     resp.raise_for_status()
 
 
-def get_arxiv_feed(subject: str = "econ.em+stat.me"):
+def get_arxiv_feed(subject: str = "cs.si+soc-ph"):
     """get skeetable list of paper title, link, and (fragment of) abstract
 
     Args:
@@ -157,8 +150,11 @@ def get_arxiv_feed(subject: str = "econ.em+stat.me"):
 
 def get_and_write_feed_json(feedname="econ.em+stat.me", filename="combined.json"):
     feed = get_arxiv_feed(feedname)
-    with open(filename, "r") as f:
-        archive = json.load(f)
+    try:
+        with open(filename, "r") as f:
+            archive = json.load(f)
+    except FileNotFoundError:  # if file doesn't exist
+        archive = {}
     new_archive = archive.copy()
     # append new items
     for k, v in feed.items():
@@ -184,7 +180,7 @@ def main():
     for k, v in pull.items():
         if k not in archive:  # if not already posted
             post_str = (
-                f"{v['title']}\n{v['link']}\n{''.join(v['description'])}"[:297] + "\n📈🤖"
+                    f"{v['title']}\n{v['link']}\n{''.join(v['description'])}"[:297] + "\n📈🤖"
             )
             create_post(post_str.replace("\n", " "))
             time.sleep(random.randint(60, 300))
@@ -194,13 +190,14 @@ def main():
         print("No new papers found; posting random paper from archive")
         random_paper = random.choice(list(archive.values()))
         post_str = (
-            f"{random_paper['title']}\n{random_paper['link']}\n{''.join(random_paper['description'])}"[
+                f"{random_paper['title']}\n{random_paper['link']}\n{''.join(random_paper['description'])}"[
                 :297
-            ]
-            + "\n📈🤖"
+                ]
+                + "\n📈🤖"
         )
         create_post(post_str.replace("\n", " "))
         time.sleep(random.randint(30, 60))
+
 
 # %%
 if __name__ == "__main__":
