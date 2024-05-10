@@ -195,7 +195,7 @@ def main():
                 ]
                 + "\n📈🤖"
         )
-        create_post(post_str.replace("\n", " "))
+        create_post(post_str.replace("\n", " ").replace("v1 Announce Type: new", "v1"))
         time.sleep(random.randint(30, 60))
 
 
