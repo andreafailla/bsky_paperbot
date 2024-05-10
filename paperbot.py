@@ -9,7 +9,7 @@ import random
 
 import requests
 import feedparser
-
+from bs4 import BeautifulSoup
 
 
 # %%
@@ -29,7 +29,8 @@ def bsky_login_session(pds_url: str, handle: str, password: str) -> Dict:
         json={"identifier": handle, "password": password},
     )
     resp.raise_for_status()
-    return resp.json()
+    resp = resp.json()
+    return resp
 
 
 def parse_urls(text: str) -> List[Dict]:
@@ -81,6 +82,55 @@ def parse_facets(text: str) -> List[Dict]:
     return facets
 
 
+"""def fetch_embed_url_card(access_token: str, url: str) -> Dict:
+    # the required fields for every embed card
+    card = {
+        "uri": url,
+        "title": "",
+        "description": "",
+    }
+
+    # fetch the HTML
+    resp = requests.get(url)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # parse out the "og:title" and "og:description" HTML meta tags
+    title_tag = soup.find("meta", property="og:title")
+    if title_tag:
+        card["title"] = title_tag["content"]
+    description_tag = soup.find("meta", property="og:description")
+    if description_tag:
+        card["description"] = description_tag["content"]
+
+    # if there is an "og:image" HTML meta tag, fetch and upload that image
+    image_tag = soup.find("meta", property="og:image")
+    if image_tag:
+        img_url = image_tag["content"]
+        # naively turn a "relative" URL (just a path) into a full URL, if needed
+        if "://" not in img_url:
+            img_url = url + img_url
+        resp = requests.get(img_url)
+        resp.raise_for_status()
+
+        blob_resp = requests.post(
+            "https://bsky.social/xrpc/com.atproto.repo.uploadBlob",
+            headers={
+                "Content-Type": resp.headers["Content-Type"],  #
+                # image mimetype
+                "Authorization": "Bearer " + access_token,
+            },
+            data=resp.content,
+        )
+        blob_resp.raise_for_status()
+        card["thumb"] = blob_resp.json()["blob"]
+
+    return {
+        "$type": "app.bsky.embed.external",
+        "external": card,
+    }"""
+
+
 def create_post(
         text: str,
         pds_url: str = "https://bsky.social",
@@ -109,6 +159,10 @@ def create_post(
         facets = parse_facets(post["text"])
         if facets:
             post["facets"] = facets
+
+            # add link embed according to the URL
+
+            #post["embeds"] = fetch_embed_url_card(session["accessJwt"], facets[0]["features"][0]["uri"])
 
     resp = requests.post(
         pds_url + "/xrpc/com.atproto.repo.createRecord",
@@ -181,23 +235,15 @@ def main():
     for k, v in pull.items():
         if k not in archive:  # if not already posted
             post_str = (
-                    f"{v['title']}\n{v['link']}\n{''.join(v['description'])}"[:297] + "\n📈🤖"
+                    f"{v['title']}\n{v['link']}\n{''.join(v['description']).split('Abstract:')[-1].strip()}"[:297] + "\n📈🤖"
             )
-            create_post(post_str.replace("\n", " "))
+            create_post(post_str)
             time.sleep(random.randint(60, 300))
             archive[k] = v
             new_posts += 1
     if new_posts == 0 & (len(archive) > 2):
-        print("No new papers found; posting random paper from archive")
-        random_paper = random.choice(list(archive.values()))
-        post_str = (
-                f"{random_paper['title']}\n{random_paper['link']}\n{''.join(random_paper['description'])}"[
-                :297
-                ]
-                + "\n📈🤖"
-        )
-        create_post( 'Abstract:' + post_str.replace("\n", " ").split('Abstract:')[1])
-        time.sleep(random.randint(30, 60))
+        post_str = "No new papers today! 📈🤖"
+        create_post(post_str.replace("\n", " "))
 
 
 # %%
