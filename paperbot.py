@@ -243,9 +243,7 @@ def main():
             time.sleep(random.randint(60, 300))
             archive[k] = v
             new_posts += 1
-    if new_posts == 0 & (len(archive) > 2):
-        post_str = "No new papers today! 📈🤖"
-        create_post(post_str)
+    
 
 
 # %%
