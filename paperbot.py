@@ -1,18 +1,55 @@
-import time
-import re
-import os
-import sys
-import json
-from typing import List, Dict
-from datetime import datetime, timezone
-import random
+"""Bluesky bot: reads an arXiv RSS feed and posts papers it has not posted yet.
 
-import requests
+State lives in ``combined.json`` (link -> entry). An entry is added to it only
+after its post succeeded, and the file is rewritten after every post, so a crash
+or API error can neither lose a paper nor cause a double post.
+"""
+
+import json
+import logging
+import os
+import random
+import re
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Tuple
+
 import feedparser
+import requests
 from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
+
+PDS_URL = "https://bsky.social"
+FEED_SUBJECT = "cs.si+physics.soc-ph"
+ARCHIVE_FILE = "combined.json"
+MAX_POST_LEN = 300  # Bluesky limit, in graphemes (code points here is a safe upper bound)
+POST_SUFFIX = "...📈🤖"
+REQUEST_TIMEOUT = 30  # seconds; without it a stalled connection hangs the job
+SLEEP_RANGE = (60, 300)  # seconds between posts
+SESSION_MAX_AGE = 3000  # seconds; access tokens last ~2h, refresh well before
 
 
 # %%
+def get_credentials() -> Tuple[str, str]:
+    """Read bot credentials from the environment.
+
+    Read at call time, not import time, so the module can be imported (e.g. by
+    tests) without secrets.
+
+    Returns:
+        (handle, password); the password should be a Bluesky app password.
+    """
+    try:
+        return os.environ["BSKYBOT"], os.environ["BSKYPWD"]
+    except KeyError as e:
+        raise SystemExit(
+            f"Missing environment variable {e}. Set BSKYBOT (handle) and BSKYPWD (app password)."
+        ) from e
+
+
 def bsky_login_session(pds_url: str, handle: str, password: str) -> Dict:
     """login to blueksy
 
@@ -27,10 +64,10 @@ def bsky_login_session(pds_url: str, handle: str, password: str) -> Dict:
     resp = requests.post(
         pds_url + "/xrpc/com.atproto.server.createSession",
         json={"identifier": handle, "password": password},
+        timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
-    resp = resp.json()
-    return resp
+    return resp.json()
 
 
 def parse_urls(text: str) -> List[Dict]:
@@ -83,16 +120,16 @@ def parse_facets(text: str) -> List[Dict]:
 
 
 def fetch_embed_url_card(access_token: str, url: str) -> Dict:
-    # TODO make this work... :(
+    # TODO make this work... :(  (currently unused; see docs/IMPROVEMENT_PLAN.md)
     # the required fields for every embed card
-    card = {
+    card: Dict[str, Any] = {
         "uri": url,
         "title": "",
         "description": "",
     }
 
     # fetch the HTML
-    resp = requests.get(url)
+    resp = requests.get(url, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -109,11 +146,11 @@ def fetch_embed_url_card(access_token: str, url: str) -> Dict:
     image_tag = soup.find("img", alt="arxiv logo")
     # get the src attribute of the image tag
     if image_tag:
-        img_url = image_tag["src"]
+        img_url = str(image_tag["src"])
         # naively turn a "relative" URL (just a path) into a full URL, if needed
         if "://" not in img_url:
             img_url = url + img_url
-        resp = requests.get(img_url)
+        resp = requests.get(img_url, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
 
         blob_resp = requests.post(
@@ -123,6 +160,7 @@ def fetch_embed_url_card(access_token: str, url: str) -> Dict:
                 "Authorization": "Bearer " + access_token,
             },
             data=resp.content,
+            timeout=REQUEST_TIMEOUT,
         )
         blob_resp.raise_for_status()
         card["thumb"] = blob_resp.json()["blob"]
@@ -133,38 +171,32 @@ def fetch_embed_url_card(access_token: str, url: str) -> Dict:
     }
 
 
-def create_post(
-        text: str,
-        pds_url: str = "https://bsky.social",
-        handle: str = os.environ["BSKYBOT"],
-        password: str = os.environ["BSKYPWD"],
-):
+def create_post(text: str, session: Dict, pds_url: str = PDS_URL) -> str:
     """post on bluesky
 
     Args:
-        text (str): text
+        text (str): post text; URLs in it become clickable links.
+        session (Dict): result of ``bsky_login_session`` (one login serves many posts).
         pds_url (str, optional): bsky Defaults to "https://bsky.social".
-        handle (_type_, optional):  Defaults to os.environ["BSKYBOT"]. Set this environmental variable in your dotfile (bashrc/zshrc).
-        password (_type_, optional): _description_. Defaults to os.environ["BSKYPWD"].
+
+    Returns:
+        str: AT URI of the new post.
+
+    Raises:
+        requests.HTTPError: if Bluesky rejects the post.
     """
-    session = bsky_login_session(pds_url, handle, password)
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     # these are the required fields which every post must include
-    post = {
+    post: Dict[str, Any] = {
         "$type": "app.bsky.feed.post",
         "text": text,
         "createdAt": now,
     }
 
     # parse out mentions and URLs as "facets"
-    if len(text) > 0:
-        facets = parse_facets(post["text"])
-        if facets:
-            post["facets"] = facets
-
-            # add link embed according to the URL
-            #
-            #post["embeds"] = fetch_embed_url_card(session["accessJwt"], facets[0]["features"][0]["uri"])
+    facets = parse_facets(text) if text else []
+    if facets:
+        post["facets"] = facets
 
     resp = requests.post(
         pds_url + "/xrpc/com.atproto.repo.createRecord",
@@ -174,27 +206,54 @@ def create_post(
             "collection": "app.bsky.feed.post",
             "record": post,
         },
+        timeout=REQUEST_TIMEOUT,
     )
-    print("createRecord response:", file=sys.stderr)
-    print(json.dumps(resp.json(), indent=2))
+    if not resp.ok:
+        logger.error("createRecord failed: %s %s", resp.status_code, resp.text[:500])
     resp.raise_for_status()
+    uri = resp.json().get("uri", "")
+    logger.info("posted %s", uri)
+    return uri
 
 
-def get_arxiv_feed(subject: str = "cs.si+physics.soc-ph"):
+def build_post_text(title: str, link: str, description: str) -> str:
+    """Format ``title / link / abstract`` so it fits in one post.
+
+    Only the abstract (and, as a last resort, the title) is shortened. The link
+    is never cut: a cut link would lose its clickable facet.
+    """
+    abstract = description.split("Abstract:")[-1].strip()
+    # budget left for the title once link, two newlines and suffix are reserved
+    title_room = MAX_POST_LEN - len(link) - 2 - len(POST_SUFFIX)
+    if len(title) > title_room:
+        title = title[: max(title_room - 1, 0)].rstrip() + "…"
+    head = f"{title}\n{link}\n"
+    room = MAX_POST_LEN - len(head) - len(POST_SUFFIX)
+    return head + abstract[: max(room, 0)] + POST_SUFFIX
+
+
+def get_arxiv_feed(subject: str = FEED_SUBJECT) -> Dict[str, Dict]:
     """get skeetable list of paper title, link, and (fragment of) abstract
 
     Args:
-        subject (str): valid arxiv subject, defaults to combined econ.EM and stat.ME
+        subject (str): valid arxiv subject, e.g. "cs.si+physics.soc-ph"
 
     Returns:
-        list of skeets
+        dict link -> {title, link, description}
+
+    Raises:
+        requests.RequestException: feed could not be downloaded.
+        RuntimeError: response was not a parseable feed (an empty but valid feed,
+            e.g. on weekends, is fine and returns {}).
     """
-    feed_url = f"https://rss.arxiv.org/rss/{subject}"
-    feed = feedparser.parse(feed_url)
-    # dict of all entries
-    res = {
+    resp = requests.get(f"https://rss.arxiv.org/rss/{subject}", timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    feed = feedparser.parse(resp.content)
+    if feed.bozo and not feed.entries:
+        raise RuntimeError(f"Could not parse arXiv feed for {subject}: {feed.bozo_exception}")
+    return {
         entry.link.strip(): {
-            "title": entry.title.split(".")[0].strip(),
+            "title": entry.title.strip(),
             "link": entry.link.strip(),
             "description": entry.description.replace("<p>", "")
             .replace("</p>", "")
@@ -202,52 +261,74 @@ def get_arxiv_feed(subject: str = "cs.si+physics.soc-ph"):
         }
         for entry in feed.entries
     }
-    return res
 
 
-def get_and_write_feed_json(feedname="cs.si+physics.soc-ph", filename="combined.json"):
-    feed = get_arxiv_feed(feedname)
+def load_archive(filename: str = ARCHIVE_FILE) -> Dict[str, Dict]:
+    """Load the archive of already-posted papers ({} if the file does not exist)."""
     try:
         with open(filename, "r") as f:
-            archive = json.load(f)
-    except FileNotFoundError:  # if file doesn't exist
-        archive = {}
-    new_archive = archive.copy()
-    # append new items
-    for k, v in feed.items():
-        if k not in archive:
-            new_archive[k] = v
-    # write out only if new items exist
-    if len(new_archive) > len(archive):
-        with open(filename, "w") as f:
-            json.dump(new_archive, f, indent=None)
-        print(f"{filename} updated")
-    return feed, archive
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def save_archive(archive: Dict[str, Dict], filename: str = ARCHIVE_FILE) -> None:
+    """Write the archive atomically: a crash mid-write cannot corrupt the file."""
+    directory = os.path.dirname(os.path.abspath(filename))
+    fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(archive, f, indent=None)
+        os.replace(tmp_path, filename)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 
 # %%
-def main():
-    pull, archive = get_and_write_feed_json()
-    ######################################################################
-    # stats
-    ######################################################################
-    # read existing data from "stat_me_draws.json" file
-    new_posts = 0
-    # Append new data to existing data
-    for k, v in pull.items():
-        if k not in archive:  # if not already posted
-            post_str = (
-                    f"{v['title']}\n{v['link']}\n{''.join(v['description']).split('Abstract:')[-1].strip()}"[:293] + "...📈🤖"
-            )
-            create_post(post_str)
-            time.sleep(random.randint(60, 300))
-            archive[k] = v
-            new_posts += 1
-    
+def main() -> int:
+    """Post every feed entry that is not in the archive yet.
+
+    An entry is archived only after its post succeeded, and the archive is saved
+    after each post. A failed post is logged and left un-archived so the next run
+    retries it; the remaining entries are still attempted.
+
+    Returns:
+        Process exit code: 0 if everything went out, 1 if any post failed.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    handle, password = get_credentials()
+    archive = load_archive()
+    feed = get_arxiv_feed()
+    new = {k: v for k, v in feed.items() if k not in archive}
+    logger.info("%d entries in feed, %d not posted yet", len(feed), len(new))
+    if not new:
+        return 0
+
+    session = bsky_login_session(PDS_URL, handle, password)
+    logged_in_at = time.monotonic()
+    failures = 0
+    for i, (key, entry) in enumerate(new.items()):
+        if time.monotonic() - logged_in_at > SESSION_MAX_AGE:
+            session = bsky_login_session(PDS_URL, handle, password)
+            logged_in_at = time.monotonic()
+        text = build_post_text(entry["title"], entry["link"], entry["description"])
+        try:
+            create_post(text, session)
+        except requests.RequestException:
+            logger.exception("failed to post %s", key)
+            failures += 1
+            continue
+        archive[key] = entry
+        save_archive(archive)
+        if i < len(new) - 1:
+            time.sleep(random.randint(*SLEEP_RANGE))
+    if failures:
+        logger.error("%d of %d posts failed; they will be retried on the next run", failures, len(new))
+    return 1 if failures else 0
 
 
 # %%
 if __name__ == "__main__":
-    main()
-
-# %%
+    sys.exit(main())

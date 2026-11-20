@@ -4,18 +4,28 @@ on:
   schedule:
     - cron: "0 1,3,16,19,22 * * *"
 
+# The job commits the updated archive (combined.json) back to the repo.
+permissions:
+  contents: write
+
+# Two overlapping runs would double-post and race on the archive push.
+concurrency:
+  group: posterbot
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    # posts are spaced 1-5 min apart; cap the job so a hang cannot burn hours
+    timeout-minutes: 120
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.ref }}
-      - uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
+          # 3.9 is end-of-life and is missing from the ubuntu-latest (26.04) image,
+          # which broke every run from 2026-11-02.
+          python-version: '3.12'
           cache: 'pip' # caching pip dependencies
       - run: pip install -r requirements.txt
       - name: scrape and run
@@ -23,9 +33,13 @@ jobs:
         env:
           BSKYBOT: ${{ secrets.BSKYBOT }}
           BSKYPWD: ${{ secrets.BSKYPWD }}
+      # always(): paperbot.py saves the archive after every successful post, so
+      # even if a later post fails, the ones that went out are recorded and are
+      # not posted again on the next run.
       - name: Commit and push
+        if: always()
         uses: EndBug/add-and-commit@v9
         with:
-          add: "."
+          add: "combined.json"
           push: true
           default_author: github_actions
