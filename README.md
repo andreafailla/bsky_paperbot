@@ -21,6 +21,8 @@ pytest          # offline: network and Bluesky are mocked, no credentials needed
 
 Posted papers are tracked in `combined.json`. A paper is added only after its post succeeded, so failed posts are retried on the next run.
 
+Knobs at the top of `paperbot.py`: `FEED_SUBJECT` (arXiv categories), `USE_LINK_CARD` (attach a link card to each post), `SKIP_ANNOUNCE_TYPES` (arXiv revisions are not posted), `SLEEP_RANGE` (seconds between posts). If a run fails, the workflow opens a `bot-failure` issue; the next good run closes it.
+
 See [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md) for known gaps and planned work.
 
 [![GH Arxiv Posterbot](https://github.com/andreafailla/bsky_paperbot/actions/workflows/post.yml/badge.svg?branch=master)](https://github.com/andreafailla/bsky_paperbot/actions/workflows/post.yml)

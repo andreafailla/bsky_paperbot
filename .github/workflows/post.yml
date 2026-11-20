@@ -4,18 +4,27 @@ on:
   schedule:
     - cron: "0 1,3,16,19,22 * * *"
 
-# The job commits the updated archive (combined.json) back to the repo.
+# contents: the job commits the updated archive (combined.json) back to the repo.
+# issues: a failed run opens (or comments on) an issue so an outage is noticed.
 permissions:
   contents: write
+  issues: write
 
 # Two overlapping runs would double-post and race on the archive push.
 concurrency:
   group: posterbot
   cancel-in-progress: false
 
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned: "ubuntu-latest" moving to a new image (26.04) without Python 3.9
+    # broke every run from 2026-11-02 to 2026-11-21.
+    runs-on: ubuntu-24.04
     # posts are spaced 1-5 min apart; cap the job so a hang cannot burn hours
     timeout-minutes: 120
     steps:
@@ -23,8 +32,6 @@ jobs:
         uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
-          # 3.9 is end-of-life and is missing from the ubuntu-latest (26.04) image,
-          # which broke every run from 2026-11-02.
           python-version: '3.12'
           cache: 'pip' # caching pip dependencies
       - run: pip install -r requirements.txt
@@ -43,3 +50,20 @@ jobs:
           add: "combined.json"
           push: true
           default_author: github_actions
+      - name: Report the failure in an issue
+        if: failure()
+        run: |
+          gh label create bot-failure --color B60205 --description "posterbot run failed" || true
+          open=$(gh issue list --label bot-failure --state open --json number --jq '.[0].number // empty')
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "Failed again: $RUN_URL"
+          else
+            gh issue create --label bot-failure --title "Posterbot run failed" \
+              --body "The scheduled run failed: $RUN_URL"
+          fi
+      - name: Close the failure issue after a good run
+        if: success()
+        run: |
+          for n in $(gh issue list --label bot-failure --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Recovered: $RUN_URL"
+          done

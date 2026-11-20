@@ -135,27 +135,27 @@ def test_non_ascii_title_facet_offsets_are_byte_offsets():
 # --- get_arxiv_feed --------------------------------------------------------
 def test_title_with_periods_is_not_truncated():
     xml = rss(("Scaling in 2.5D networks vs. random graphs", LINK, "<p>Abstract: x</p>"))
-    with mock.patch("paperbot.requests.get", return_value=fake_response(xml)):
+    with mock.patch("paperbot.requests.request", return_value=fake_response(xml)):
         feed = paperbot.get_arxiv_feed()
     assert feed[LINK]["title"] == "Scaling in 2.5D networks vs. random graphs"
     assert feed[LINK]["description"] == "Abstract: x"
 
 
 def test_empty_valid_feed_is_ok():
-    with mock.patch("paperbot.requests.get", return_value=fake_response(rss())):
+    with mock.patch("paperbot.requests.request", return_value=fake_response(rss())):
         assert paperbot.get_arxiv_feed() == {}
 
 
 def test_garbage_response_raises_instead_of_silently_posting_nothing():
     bad = fake_response(b"<html><body>502 Bad Gateway")
-    with mock.patch("paperbot.requests.get", return_value=bad), pytest.raises(RuntimeError):
+    with mock.patch("paperbot.requests.request", return_value=bad), pytest.raises(RuntimeError):
         paperbot.get_arxiv_feed()
 
 
 def test_http_error_propagates():
     resp = fake_response(b"")
     resp.raise_for_status.side_effect = requests.HTTPError("503")
-    with mock.patch("paperbot.requests.get", return_value=resp), pytest.raises(requests.HTTPError):
+    with mock.patch("paperbot.requests.request", return_value=resp), pytest.raises(requests.HTTPError):
         paperbot.get_arxiv_feed()
 
 
@@ -257,7 +257,7 @@ def test_main_archives_only_the_stored_fields_and_passes_authors_to_the_post(bot
 def test_create_post_sends_language_and_link_facet():
     resp = mock.Mock(ok=True)
     resp.json.return_value = {"uri": "at://did:x/app.bsky.feed.post/1"}
-    with mock.patch("paperbot.requests.post", return_value=resp) as post:
+    with mock.patch("paperbot.requests.request", return_value=resp) as post:
         paperbot.create_post(f"Title\n{LINK}\nabstract", {"accessJwt": "j", "did": "did:x"})
     record = post.call_args.kwargs["json"]["record"]
     assert record["langs"] == ["en"]
@@ -280,3 +280,146 @@ def test_missing_credentials_exit_with_clear_message(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         paperbot.get_credentials()
     assert "BSKYBOT" in str(exc.value)
+
+
+# --- retry with backoff ----------------------------------------------------
+def status_response(code: int, headers=None) -> mock.Mock:
+    r = mock.Mock(status_code=code, headers=headers or {}, ok=code < 400, text=f"error body {code}")
+    r.raise_for_status.side_effect = requests.HTTPError(str(code)) if code >= 400 else None
+    return r
+
+
+@pytest.fixture
+def sleeps(monkeypatch):
+    recorded: list = []
+    monkeypatch.setattr(paperbot.time, "sleep", recorded.append)
+    return recorded
+
+
+def test_retry_recovers_from_a_transient_503(sleeps):
+    with mock.patch("paperbot.requests.request", side_effect=[status_response(503), status_response(200)]) as req:
+        resp = paperbot.request_with_retry("GET", "https://x")
+    assert resp.status_code == 200 and req.call_count == 2
+    assert sleeps == [paperbot.RETRY_WAITS[0]]
+
+
+def test_retry_gives_up_after_the_last_attempt_and_returns_the_failing_response(sleeps):
+    n = len(paperbot.RETRY_WAITS) + 1
+    with mock.patch("paperbot.requests.request", side_effect=[status_response(503)] * n) as req:
+        resp = paperbot.request_with_retry("GET", "https://x")
+    assert resp.status_code == 503 and req.call_count == n
+    assert sleeps == list(paperbot.RETRY_WAITS)
+
+
+def test_retry_raises_the_last_exception_when_every_attempt_times_out(sleeps):
+    n = len(paperbot.RETRY_WAITS) + 1
+    with mock.patch("paperbot.requests.request", side_effect=[requests.ReadTimeout("t")] * n), \
+            pytest.raises(requests.ReadTimeout):
+        paperbot.request_with_retry("GET", "https://x")
+    assert len(sleeps) == len(paperbot.RETRY_WAITS)
+
+
+def test_retry_does_not_retry_a_client_error(sleeps):
+    with mock.patch("paperbot.requests.request", return_value=status_response(401)) as req:
+        assert paperbot.request_with_retry("POST", "https://x").status_code == 401
+    assert req.call_count == 1 and sleeps == []
+
+
+def test_retry_honours_retry_after_but_caps_it(sleeps):
+    slow = status_response(429, {"Retry-After": "9999"})
+    short = status_response(429, {"Retry-After": "7"})
+    with mock.patch("paperbot.requests.request", side_effect=[slow, short, status_response(200)]):
+        paperbot.request_with_retry("GET", "https://x")
+    assert sleeps == [paperbot.MAX_RETRY_WAIT, 7]
+
+
+def test_retry_honours_bluesky_ratelimit_reset_epoch(sleeps, monkeypatch):
+    monkeypatch.setattr(paperbot.time, "time", lambda: 1000.0)
+    limited = status_response(429, {"ratelimit-reset": "1042"})
+    with mock.patch("paperbot.requests.request", side_effect=[limited, status_response(200)]):
+        paperbot.request_with_retry("GET", "https://x")
+    assert sleeps == [42]
+
+
+# --- createRecord must never be repeated when the post may already exist ----
+@pytest.mark.parametrize("code", [500, 502])
+def test_create_post_does_not_retry_after_a_server_error(code, sleeps):
+    with mock.patch("paperbot.requests.request", return_value=status_response(code)) as req, \
+            pytest.raises(requests.HTTPError):
+        paperbot.create_post("hi", {"accessJwt": "j", "did": "d"})
+    assert req.call_count == 1 and sleeps == []  # a second post could be a duplicate
+
+
+def test_create_post_does_not_retry_after_a_read_timeout(sleeps):
+    with mock.patch("paperbot.requests.request", side_effect=requests.ReadTimeout("t")) as req, \
+            pytest.raises(requests.ReadTimeout):
+        paperbot.create_post("hi", {"accessJwt": "j", "did": "d"})
+    assert req.call_count == 1
+
+
+def test_create_post_retries_when_rate_limited(sleeps):
+    ok = status_response(200)
+    ok.json.return_value = {"uri": "at://x"}
+    with mock.patch("paperbot.requests.request", side_effect=[status_response(429), ok]) as req:
+        assert paperbot.create_post("hi", {"accessJwt": "j", "did": "d"}) == "at://x"
+    assert req.call_count == 2
+
+
+# --- link card --------------------------------------------------------------
+def test_link_card_matches_the_bluesky_external_embed_schema():
+    card = paperbot.build_link_card(LINK, "A title", "arXiv:1v1 Announce Type: new \nAbstract: Some  text &amp; more")
+    assert card == {
+        "$type": "app.bsky.embed.external",
+        "external": {"uri": LINK, "title": "A title", "description": "Some text & more"},
+    }
+    assert "thumb" not in card["external"]  # optional in the lexicon; arXiv only has a generic logo
+
+
+def test_link_card_description_is_shortened_without_cutting_words():
+    card = paperbot.build_link_card(LINK, "T", "Abstract: " + "word " * 400)
+    desc = card["external"]["description"]
+    assert len(desc) <= paperbot.CARD_DESCRIPTION_LEN and desc.endswith("…")
+    assert set(desc[:-1].split(" ")) == {"word"}
+
+
+def test_create_post_attaches_the_card():
+    ok = status_response(200)
+    ok.json.return_value = {"uri": "at://x"}
+    card = paperbot.build_link_card(LINK, "T", "Abstract: a")
+    with mock.patch("paperbot.requests.request", return_value=ok) as req:
+        paperbot.create_post("hi", {"accessJwt": "j", "did": "d"}, card=card)
+    assert req.call_args.kwargs["json"]["record"]["embed"] == card
+
+
+def test_create_post_falls_back_to_no_card_when_bluesky_rejects_it():
+    rejected = status_response(400)
+    rejected.text = "InvalidRequest: bad embed"
+    ok = status_response(200)
+    ok.json.return_value = {"uri": "at://x"}
+    card = paperbot.build_link_card(LINK, "T", "Abstract: a")
+    with mock.patch("paperbot.requests.request", side_effect=[rejected, ok]) as req:
+        assert paperbot.create_post("hi", {"accessJwt": "j", "did": "d"}, card=card) == "at://x"
+    first, second = (c.kwargs["json"]["record"] for c in req.call_args_list)
+    assert "embed" in first and "embed" not in second
+    assert second["text"] == first["text"]
+
+
+def test_create_post_without_card_does_not_retry_a_400():
+    rejected = status_response(400)
+    rejected.text = "bad"
+    with mock.patch("paperbot.requests.request", return_value=rejected) as req, pytest.raises(requests.HTTPError):
+        paperbot.create_post("hi", {"accessJwt": "j", "did": "d"})
+    assert req.call_count == 1
+
+
+def test_main_attaches_a_card_unless_disabled(bot, monkeypatch):
+    monkeypatch.setattr(paperbot, "get_arxiv_feed", lambda *a, **k: entries(1))
+    cards = []
+    monkeypatch.setattr(paperbot, "create_post", lambda text, session, *a, card=None, **k: cards.append(card))
+    paperbot.main()
+    assert cards[0]["external"]["uri"] == "https://arxiv.org/abs/new0"
+    (bot / "combined.json").unlink()
+    cards.clear()
+    monkeypatch.setattr(paperbot, "USE_LINK_CARD", False)
+    paperbot.main()
+    assert cards == [None]

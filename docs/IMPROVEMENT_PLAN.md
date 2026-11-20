@@ -34,24 +34,40 @@ Checked on all 8,945 archived descriptions: 0 posts over 300 chars, 0 non-clicka
 | No language tag | `langs: ["en"]` |
 | Archive entries only needed for de-duplication | Same three fields as before (`title`, `link`, `description`), so `combined.json` stays compatible |
 
-Not done on purpose: **link card** (see P1 item 6). A card repeats the title and abstract already in the text, and its rendering cannot be verified without a real post. The Bluesky schema was checked (`external` needs only `uri`, `title`, `description`; thumbnail optional), so a text-only card is valid when you want it.
+Link cards were added in the third pass below.
+
+## Third pass (done)
+
+| Change | Detail |
+|---|---|
+| **Link card** | Each post carries an `app.bsky.embed.external` card (`uri`, `title`, abstract up to 500 chars). Switch off with `USE_LINK_CARD = False`. If Bluesky answers 400 to a post with a card, the same post is sent once without it, so a card problem can never stop the bot. |
+| **No thumbnail** | arXiv abs pages do have an `og:image`, but it is the generic arXiv logo (an earlier version of this document claimed there was none). Fetching and uploading it per post adds two requests for no information, so there is no `thumb`. This also removed the dead, broken `fetch_embed_url_card` and the `beautifulsoup4` dependency. |
+| **Retry with backoff** | Feed download, login and posting retry 429/5xx and connection errors after 5, 20, 60 s; a `Retry-After` / `ratelimit-reset` wait is honoured (capped at 300 s). **Posting is retried only on 429/503 and failed connection attempts**: after a read timeout or a 500 the post may already exist, and repeating it would be a duplicate. |
+| **Failure alerts** | A failed run opens (or comments on) a `bot-failure` issue; the next good run closes it. Needs `issues: write` (set in the workflow). |
+| **Tests in CI** | `test.yml` runs pytest on every push to `master` and on pull requests. `tests/conftest.py` makes any un-mocked HTTP request fail the test (see below). |
+| **Pinning** | `runs-on: ubuntu-24.04` instead of `ubuntu-latest`; `.github/dependabot.yml` (monthly, actions and pip); `requirements.txt` lower bounds. |
+
+What was checked: 49 tests pass, mypy clean. A dry run read the live arXiv feed and intercepted every POST to Bluesky at the HTTP layer: 9 records, all valid against the official `app.bsky.feed.post` and `app.bsky.embed.external` lexicons (required fields, no unknown fields, text ≤ 300 graphemes, `langs` ≤ 3).
+**Not verified:** how the card renders in the Bluesky app (needs a real post); the failure-issue steps and `test.yml` on GitHub (YAML and shell syntax were checked, they have not run).
+
+A mistake worth recording: while moving the HTTP calls to a retry helper, one test still mocked the old function and sent a real request to `bsky.social` with a dummy token (answer: 400 InvalidToken, nothing was posted). `tests/conftest.py` now blocks real HTTP in every test.
 
 ## Planned improvements
 
 ### P0: decide or do soon
 
 1. ~~**Stop posting revised papers as new.**~~ Done in the post-quality pass (see above).
-2. **Failure alerts.** The bot was red for 19 days without anyone noticing. Options: a final `if: failure()` step that opens/updates a GitHub issue (`gh issue create`), or a staleness check ("no post in 4 days" while the feed has entries). Pick one; the issue approach needs no external service.
-3. **Pin what drifted.** The outage was caused by `ubuntu-latest` + an old Python. Pin `runs-on: ubuntu-24.04`, keep `python-version: '3.12'`, add `.github/dependabot.yml` for `github-actions` and `pip`, and give `requirements.txt` lower bounds (or a lock file).
+2. ~~**Failure alerts.**~~ Done (third pass).
+3. ~~**Pin what drifted.**~~ Done (third pass): `ubuntu-24.04`, Dependabot, lower bounds. Python stays at 3.12.
 4. **Rollout of this branch** (see below).
 
 ### P1: next
 
-5. **Archive bloat.** `combined.json` is 13.9 MB; 12.2 MB (88%) is abstract text that is never read again, because only the keys are used for de-duplication. Each bot commit rewrites the whole single-line file, so the clone is 37 MB after 834 commits and grows daily. Plan: new append-only `posted.txt` (one arXiv id per line, ~0.3 MB), one-off migration script from `combined.json`, loader that reads either, then stop writing abstracts. Optional: keep metadata in a separate JSONL if you want the dataset.
-6. **Link cards.** `fetch_embed_url_card` is dead and broken: wrong record key (`post["embeds"]`, must be `embed`), relative image URL built as `url + img_url`, hard-coded `image/png`, hard-coded `bsky.social`, and arXiv abs pages have no `og:image`. Either delete it, or rewrite it to a card with title/description only (no thumbnail) and call it from `create_post`.
-7. **Retry with backoff.** On 429/5xx wait (`ratelimit-reset` header) and retry 3 times instead of waiting for the next run.
-8. **Tests in CI.** Add a `pull_request`/`push` workflow running `pytest` (0.2 s). Keep it separate from the posting workflow so a test failure cannot silence the bot.
-9. **Schedule.** 5 cron runs/day, but arXiv RSS publishes once a day. To verify first (check feed `pubDate` over a few days), then cut to 2 runs (primary + one retry). Caveat: GitHub disables schedules after 60 days with no repo activity; today the bot's own commits keep it alive, so if state moves out of the repo (item 5), add a keep-alive.
+5. **Archive bloat.** `combined.json` is 13.9 MB; 12.2 MB (88%) is abstract text that is never read again, because only the keys are used for de-duplication. Each bot commit rewrites the whole single-line file: a fresh clone downloads a **105 MiB** pack for 836 commits (GitHub reports 31 MB server-side; an earlier figure of 37 MB in this document was measured on a half-finished clone and was wrong). CI is not affected (checkout is shallow), clones and backups are. Plan: new append-only `posted.txt` (one arXiv id per line, ~0.3 MB), one-off migration script from `combined.json`, loader that reads either, then stop writing abstracts. Old history stays large unless rewritten, which is not recommended.
+6. ~~**Link cards.**~~ Done (third pass).
+7. ~~**Retry with backoff.**~~ Done (third pass).
+8. ~~**Tests in CI.**~~ Done (third pass): `.github/workflows/test.yml`.
+9. **Schedule: keep 5 runs/day.** I wanted to cut it to 2, but the feed's `lastBuildDate` was 23:25 UTC while entries are dated 00:00 EST, so builds are not tied to one moment. Re-check over a week of logged feed timestamps before touching the cron. Caveat if state ever leaves the repo: GitHub disables schedules after 60 days without repo activity.
 10. ~~`langs: ["en"]` on posts~~ Done.
 
 ### P2: when convenient
@@ -61,11 +77,12 @@ Not done on purpose: **link card** (see P1 item 6). A card repeats the title and
 13. **Secrets hygiene**: `BSKYBOT`/`BSKYPWD` were last set 2024-05-10. Confirm `BSKYPWD` is an app password; rotate if unsure.
 14. **Repo hygiene**: `.idea/` is tracked (add to `.gitignore`, `git rm -r --cached .idea`); add `ruff`/`mypy` config; fork has diverged from upstream (upstream's bot also commits to its own `combined.json`, so a merge would conflict on every data commit; do not merge upstream wholesale. Upstream's added Typst step is unused by the code).
 15. **Step summary**: write posted/failed counts to `$GITHUB_STEP_SUMMARY`.
+16. **Split `paperbot.py`** (455 lines, over the 400-line guideline): `text.py` (clean/truncate/build post), `bsky.py` (retry, session, createRecord, card), `feed.py` (arXiv feed, archive), and a thin `paperbot.py` with `main()`. Do it as a pure move with the tests as safety net; the workflow still calls `python3 paperbot.py`.
 
 ## Rollout of this branch
 
 Expect the first run after the fix to post the papers currently in the feed that your stale archive does not know (3 `new`, 6 `cross`; the 1 `replace` is now skipped, so 9 posts), spaced 1-5 min apart, about 30 min total.
 
-1. Review the diff, commit, push the branch, open a PR to `master` (tests do not run in CI yet, see item 8).
+1. Review the diff, commit, push the branch, open a PR to `master` (`test.yml` runs the tests on the pull request).
 2. Merge, then trigger once: `gh workflow run post.yml -R andreafailla/bsky_paperbot`. **This posts for real** with the repo secrets. Do not run it from the branch unless you want those posts to come from the branch.
 3. Watch it: `gh run watch -R andreafailla/bsky_paperbot`. Always pass `-R`: in a clone with an `upstream` remote, a bare `gh run list` resolves to the upstream repository and shows its history, not yours.

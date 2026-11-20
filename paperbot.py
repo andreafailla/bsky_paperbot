@@ -15,11 +15,10 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 import feedparser
 import requests
-from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +33,12 @@ MIN_ABSTRACT = 40  # below this many free characters the abstract is left out
 # They are not new papers, so they are not posted. Set to frozenset() to post everything again.
 SKIP_ANNOUNCE_TYPES = frozenset({"replace", "replace-cross"})
 ARCHIVE_FIELDS = ("title", "link", "description")  # what is stored per posted paper
+USE_LINK_CARD = True  # attach an app.bsky.embed.external card (title + abstract) to each post
+CARD_DESCRIPTION_LEN = 500  # no schema limit exists; keep the card readable
 REQUEST_TIMEOUT = 30  # seconds; without it a stalled connection hangs the job
+RETRY_WAITS = (5, 20, 60)  # seconds to wait before the 2nd, 3rd and 4th attempt
+RETRY_STATUS = frozenset({429, 500, 502, 503, 504})  # transient HTTP statuses
+MAX_RETRY_WAIT = 300  # cap for a wait requested by the server
 SLEEP_RANGE = (60, 300)  # seconds between posts
 SESSION_MAX_AGE = 3000  # seconds; access tokens last ~2h, refresh well before
 
@@ -57,6 +61,59 @@ def get_credentials() -> Tuple[str, str]:
         ) from e
 
 
+def _server_wait(resp: requests.Response) -> Optional[float]:
+    """Seconds the server asks us to wait (Retry-After, or Bluesky's ratelimit-reset epoch)."""
+    try:
+        if "Retry-After" in resp.headers:
+            return float(resp.headers["Retry-After"])
+        if "ratelimit-reset" in resp.headers:
+            return float(resp.headers["ratelimit-reset"]) - time.time()
+    except ValueError:
+        pass
+    return None
+
+
+def request_with_retry(
+    method: str,
+    url: str,
+    *,
+    retry_status: frozenset = RETRY_STATUS,
+    retry_errors: Tuple[Type[Exception], ...] = (requests.ConnectionError, requests.Timeout),
+    **kwargs: Any,
+) -> requests.Response:
+    """``requests.request`` that retries transient failures with a growing wait.
+
+    Retries on the HTTP statuses in ``retry_status`` and on the exceptions in
+    ``retry_errors``; a wait requested by the server (429) is honoured, capped
+    at MAX_RETRY_WAIT. After the last attempt the final response is returned
+    (the caller decides with ``raise_for_status``) or the final exception raised.
+    Non-idempotent calls pass narrower ``retry_status`` / ``retry_errors`` so a
+    request the server may already have processed is never repeated.
+    """
+    kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+    waits = list(RETRY_WAITS)
+    while True:
+        error: Optional[Exception] = None
+        delay: Optional[float] = None
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except retry_errors as e:
+            error, reason = e, type(e).__name__
+        else:
+            if resp.status_code not in retry_status:
+                return resp
+            reason, delay = f"HTTP {resp.status_code}", _server_wait(resp)
+        if not waits:
+            if error is not None:
+                raise error
+            return resp
+        wait: float = waits.pop(0)
+        if delay is not None and delay > 0:
+            wait = min(delay, MAX_RETRY_WAIT)
+        logger.warning("%s %s failed (%s); retrying in %.0fs", method, url, reason, wait)
+        time.sleep(wait)
+
+
 def bsky_login_session(pds_url: str, handle: str, password: str) -> Dict:
     """login to blueksy
 
@@ -68,10 +125,10 @@ def bsky_login_session(pds_url: str, handle: str, password: str) -> Dict:
     Returns:
         Dict: json blob with login
     """
-    resp = requests.post(
+    resp = request_with_retry(
+        "POST",
         pds_url + "/xrpc/com.atproto.server.createSession",
         json={"identifier": handle, "password": password},
-        timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
     return resp.json()
@@ -126,65 +183,39 @@ def parse_facets(text: str) -> List[Dict]:
     return facets
 
 
-def fetch_embed_url_card(access_token: str, url: str) -> Dict:
-    # TODO make this work... :(  (currently unused; see docs/IMPROVEMENT_PLAN.md)
-    # the required fields for every embed card
-    card: Dict[str, Any] = {
-        "uri": url,
-        "title": "",
-        "description": "",
-    }
+def _create_record(post: Dict[str, Any], session: Dict, pds_url: str) -> requests.Response:
+    """Send one createRecord call.
 
-    # fetch the HTML
-    resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # parse out the "og:title" and "og:description" HTML meta tags
-    title_tag = soup.find("meta", property="og:title")
-    if title_tag:
-        card["title"] = title_tag["content"]
-
-    description_tag = soup.find("meta", property="og:description")
-    if description_tag:
-        card["description"] = description_tag["content"]
-
-    # find the first image tag that has alt="arxiv logo"
-    image_tag = soup.find("img", alt="arxiv logo")
-    # get the src attribute of the image tag
-    if image_tag:
-        img_url = str(image_tag["src"])
-        # naively turn a "relative" URL (just a path) into a full URL, if needed
-        if "://" not in img_url:
-            img_url = url + img_url
-        resp = requests.get(img_url, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-
-        blob_resp = requests.post(
-            "https://bsky.social/xrpc/com.atproto.repo.uploadBlob",
-            headers={
-                "Content-Type": 'image/png',
-                "Authorization": "Bearer " + access_token,
-            },
-            data=resp.content,
-            timeout=REQUEST_TIMEOUT,
-        )
-        blob_resp.raise_for_status()
-        card["thumb"] = blob_resp.json()["blob"]
-
-    return {
-        "$type": "app.bsky.embed.external",
-        "external": card,
-    }
+    A new post is not idempotent, so only failures where the server certainly did
+    not create it are retried: 429/503 and a failed connection attempt. A read
+    timeout or a 500 is not retried, since the post may already exist.
+    """
+    return request_with_retry(
+        "POST",
+        pds_url + "/xrpc/com.atproto.repo.createRecord",
+        headers={"Authorization": "Bearer " + session["accessJwt"]},
+        json={
+            "repo": session["did"],
+            "collection": "app.bsky.feed.post",
+            "record": post,
+        },
+        retry_status=frozenset({429, 503}),
+        retry_errors=(requests.ConnectTimeout,),
+    )
 
 
-def create_post(text: str, session: Dict, pds_url: str = PDS_URL) -> str:
+def create_post(
+    text: str, session: Dict, pds_url: str = PDS_URL, card: Optional[Dict[str, Any]] = None
+) -> str:
     """post on bluesky
 
     Args:
         text (str): post text; URLs in it become clickable links.
         session (Dict): result of ``bsky_login_session`` (one login serves many posts).
         pds_url (str, optional): bsky Defaults to "https://bsky.social".
+        card (Dict, optional): link card from ``build_link_card``. If Bluesky rejects
+            the post with a 400 while a card is attached, it is posted once more
+            without the card, so a card problem can never stop the bot.
 
     Returns:
         str: AT URI of the new post.
@@ -205,17 +236,13 @@ def create_post(text: str, session: Dict, pds_url: str = PDS_URL) -> str:
     facets = parse_facets(text) if text else []
     if facets:
         post["facets"] = facets
+    if card:
+        post["embed"] = card
 
-    resp = requests.post(
-        pds_url + "/xrpc/com.atproto.repo.createRecord",
-        headers={"Authorization": "Bearer " + session["accessJwt"]},
-        json={
-            "repo": session["did"],
-            "collection": "app.bsky.feed.post",
-            "record": post,
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
+    resp = _create_record(post, session, pds_url)
+    if resp.status_code == 400 and card:
+        logger.warning("Bluesky rejected the post with its link card (%s); retrying without it", resp.text[:300])
+        resp = _create_record({k: v for k, v in post.items() if k != "embed"}, session, pds_url)
     if not resp.ok:
         logger.error("createRecord failed: %s %s", resp.status_code, resp.text[:500])
     resp.raise_for_status()
@@ -301,6 +328,23 @@ def build_post_text(title: str, link: str, description: str, author: str = "") -
     return (h + snippet).rstrip() + tail
 
 
+def build_link_card(link: str, title: str, description: str) -> Dict[str, Any]:
+    """app.bsky.embed.external record: a clickable preview of the arXiv page.
+
+    The lexicon requires only ``uri``, ``title`` and ``description``. There is no
+    thumbnail on purpose: arXiv's only ``og:image`` is its generic logo, and
+    fetching and uploading it for every post would add requests for no information.
+    """
+    return {
+        "$type": "app.bsky.embed.external",
+        "external": {
+            "uri": link,
+            "title": title,
+            "description": truncate_text(clean_abstract(description), CARD_DESCRIPTION_LEN),
+        },
+    }
+
+
 def get_arxiv_feed(subject: str = FEED_SUBJECT) -> Dict[str, Dict]:
     """get skeetable list of paper title, link, and (fragment of) abstract
 
@@ -315,7 +359,7 @@ def get_arxiv_feed(subject: str = FEED_SUBJECT) -> Dict[str, Dict]:
         RuntimeError: response was not a parseable feed (an empty but valid feed,
             e.g. on weekends, is fine and returns {}).
     """
-    resp = requests.get(f"https://rss.arxiv.org/rss/{subject}", timeout=REQUEST_TIMEOUT)
+    resp = request_with_retry("GET", f"https://rss.arxiv.org/rss/{subject}")
     resp.raise_for_status()
     feed = feedparser.parse(resp.content)
     if feed.bozo and not feed.entries:
@@ -390,8 +434,9 @@ def main() -> int:
             session = bsky_login_session(PDS_URL, handle, password)
             logged_in_at = time.monotonic()
         text = build_post_text(entry["title"], entry["link"], entry["description"], entry.get("author", ""))
+        card = build_link_card(entry["link"], entry["title"], entry["description"]) if USE_LINK_CARD else None
         try:
-            create_post(text, session)
+            create_post(text, session, card=card)
         except requests.RequestException:
             logger.exception("failed to post %s", key)
             failures += 1
