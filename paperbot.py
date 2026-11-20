@@ -5,6 +5,7 @@ after its post succeeded, and the file is rewritten after every post, so a crash
 or API error can neither lose a paper nor cause a double post.
 """
 
+import html
 import json
 import logging
 import os
@@ -26,7 +27,13 @@ PDS_URL = "https://bsky.social"
 FEED_SUBJECT = "cs.si+physics.soc-ph"
 ARCHIVE_FILE = "combined.json"
 MAX_POST_LEN = 300  # Bluesky limit, in graphemes (code points here is a safe upper bound)
-POST_SUFFIX = "...📈🤖"
+POST_TAIL = " 📈🤖"  # signature of the bot, always the last thing in a post
+POST_LANGS = ["en"]  # arXiv abstracts are English; lets Bluesky language feeds pick the posts up
+MIN_ABSTRACT = 40  # below this many free characters the abstract is left out
+# arXiv announces revised versions of older papers ("replace", "replace-cross") in the same feed.
+# They are not new papers, so they are not posted. Set to frozenset() to post everything again.
+SKIP_ANNOUNCE_TYPES = frozenset({"replace", "replace-cross"})
+ARCHIVE_FIELDS = ("title", "link", "description")  # what is stored per posted paper
 REQUEST_TIMEOUT = 30  # seconds; without it a stalled connection hangs the job
 SLEEP_RANGE = (60, 300)  # seconds between posts
 SESSION_MAX_AGE = 3000  # seconds; access tokens last ~2h, refresh well before
@@ -191,6 +198,7 @@ def create_post(text: str, session: Dict, pds_url: str = PDS_URL) -> str:
         "$type": "app.bsky.feed.post",
         "text": text,
         "createdAt": now,
+        "langs": POST_LANGS,
     }
 
     # parse out mentions and URLs as "facets"
@@ -216,20 +224,81 @@ def create_post(text: str, session: Dict, pds_url: str = PDS_URL) -> str:
     return uri
 
 
-def build_post_text(title: str, link: str, description: str) -> str:
-    """Format ``title / link / abstract`` so it fits in one post.
+def clean_abstract(description: str) -> str:
+    """Abstract text from a feed description: header removed, entities decoded, one line."""
+    text = description.split("Abstract:", 1)[-1]
+    return " ".join(html.unescape(text).split())
 
-    Only the abstract (and, as a last resort, the title) is shortened. The link
-    is never cut: a cut link would lose its clickable facet.
+
+def format_authors(author: str) -> str:
+    """'A, B, C' -> 'A et al.'; two authors -> 'A and B'; empty -> ''."""
+    names = [n.strip() for n in author.split(",") if n.strip()]
+    if len(names) <= 1:
+        return "".join(names)
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    return f"{names[0]} et al."
+
+
+# end of a sentence: 3+ word characters, ".!?", then a capitalised word ("e.g. x", "vs. y" do not match)
+_SENTENCE_END = re.compile(r"(?<=\w{3})[.!?](?=\s+[A-Z])")
+
+
+# words a snippet should not end on
+_DANGLING_WORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "nor", "of", "in", "on", "at", "to", "for", "with", "by",
+    "from", "as", "is", "are", "was", "were", "be", "that", "which", "than", "via", "into",
+})
+
+
+def truncate_text(text: str, room: int) -> str:
+    """Shorten ``text`` to at most ``room`` characters without cutting a word.
+
+    Prefers ending on a full sentence; otherwise ends on a word and adds "…".
+    Text that already fits is returned unchanged (no ellipsis).
     """
-    abstract = description.split("Abstract:")[-1].strip()
-    # budget left for the title once link, two newlines and suffix are reserved
-    title_room = MAX_POST_LEN - len(link) - 2 - len(POST_SUFFIX)
-    if len(title) > title_room:
-        title = title[: max(title_room - 1, 0)].rstrip() + "…"
-    head = f"{title}\n{link}\n"
-    room = MAX_POST_LEN - len(head) - len(POST_SUFFIX)
-    return head + abstract[: max(room, 0)] + POST_SUFFIX
+    if len(text) <= room:
+        return text
+    if room < 2:
+        return ""
+    cut = text[: room - 1]  # one char of room is kept for the ellipsis
+    ends = [m.end() for m in _SENTENCE_END.finditer(cut)]
+    if ends and ends[-1] >= room * 0.6 and cut[: ends[-1]].count("$") % 2 == 0:
+        return cut[: ends[-1]]
+    space = cut.rfind(" ")
+    if space < 0:
+        return ""  # one giant token (e.g. a URL): cutting it would break it
+    kept = cut[:space]
+    while kept.count("$") % 2 == 1:  # cut inside a LaTeX formula: drop the open "$..." part
+        kept = kept[: kept.rfind("$")]
+    words = kept.rstrip(" ,;:-–(").split(" ")
+    while len(words) > 1 and words[-1].lower() in _DANGLING_WORDS:  # avoid "... of the…"
+        words.pop()
+    return " ".join(words).rstrip(" ,;:-–(") + "…"
+
+
+def build_post_text(title: str, link: str, description: str, author: str = "") -> str:
+    """Format a post as ``title / link / authors / abstract snippet``, at most 300 characters.
+
+    The link is never cut (a cut link would lose its clickable facet) and the
+    abstract never ends mid-word, so a URL inside it is never split either.
+    Shortening order when space is tight: abstract first, then authors, then title.
+    """
+    authors = format_authors(author)
+    tail = POST_TAIL
+
+    def head(t: str, a: str) -> str:
+        return "\n".join([t, link] + ([a] if a else [])) + "\n"
+
+    h = head(title, authors)
+    if len(h) + len(tail) > MAX_POST_LEN - MIN_ABSTRACT:
+        h = head(title, "")  # no room for an abstract: drop the authors line first
+    if len(h) + len(tail) > MAX_POST_LEN:
+        room = MAX_POST_LEN - len(link) - 2 - len(tail)
+        h = head(title[: max(room - 1, 0)].rstrip() + "…", "")
+    room = MAX_POST_LEN - len(h) - len(tail)
+    snippet = truncate_text(clean_abstract(description), room) if room >= MIN_ABSTRACT else ""
+    return (h + snippet).rstrip() + tail
 
 
 def get_arxiv_feed(subject: str = FEED_SUBJECT) -> Dict[str, Dict]:
@@ -258,6 +327,9 @@ def get_arxiv_feed(subject: str = FEED_SUBJECT) -> Dict[str, Dict]:
             "description": entry.description.replace("<p>", "")
             .replace("</p>", "")
             .strip(),
+            # not archived (see ARCHIVE_FIELDS), only used to decide whether/how to post
+            "author": entry.get("author", ""),
+            "announce_type": entry.get("arxiv_announce_type", ""),
         }
         for entry in feed.entries
     }
@@ -301,8 +373,12 @@ def main() -> int:
     handle, password = get_credentials()
     archive = load_archive()
     feed = get_arxiv_feed()
-    new = {k: v for k, v in feed.items() if k not in archive}
-    logger.info("%d entries in feed, %d not posted yet", len(feed), len(new))
+    unseen = {k: v for k, v in feed.items() if k not in archive}
+    new = {k: v for k, v in unseen.items() if v.get("announce_type") not in SKIP_ANNOUNCE_TYPES}
+    logger.info(
+        "%d entries in feed, %d not posted yet, %d skipped as revisions of older papers",
+        len(feed), len(new), len(unseen) - len(new),
+    )
     if not new:
         return 0
 
@@ -313,14 +389,14 @@ def main() -> int:
         if time.monotonic() - logged_in_at > SESSION_MAX_AGE:
             session = bsky_login_session(PDS_URL, handle, password)
             logged_in_at = time.monotonic()
-        text = build_post_text(entry["title"], entry["link"], entry["description"])
+        text = build_post_text(entry["title"], entry["link"], entry["description"], entry.get("author", ""))
         try:
             create_post(text, session)
         except requests.RequestException:
             logger.exception("failed to post %s", key)
             failures += 1
             continue
-        archive[key] = entry
+        archive[key] = {f: entry[f] for f in ARCHIVE_FIELDS if f in entry}
         save_archive(archive)
         if i < len(new) - 1:
             time.sleep(random.randint(*SLEEP_RANGE))
