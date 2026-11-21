@@ -4,18 +4,35 @@ on:
   schedule:
     - cron: "0 1,3,16,19,22 * * *"
 
+# contents: the job commits the updated archive (combined.json) back to the repo.
+# issues: a failed run opens (or comments on) an issue so an outage is noticed.
+permissions:
+  contents: write
+  issues: write
+
+# Two overlapping runs would double-post and race on the archive push.
+concurrency:
+  group: posterbot
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned: "ubuntu-latest" moving to a new image (26.04) without Python 3.9
+    # broke every run from 2026-11-02 to 2026-11-21.
+    runs-on: ubuntu-24.04
+    # posts are spaced 1-5 min apart; cap the job so a hang cannot burn hours
+    timeout-minutes: 120
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.ref }}
-      - uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
+          python-version: '3.12'
           cache: 'pip' # caching pip dependencies
       - run: pip install -r requirements.txt
       - name: scrape and run
@@ -23,9 +40,30 @@ jobs:
         env:
           BSKYBOT: ${{ secrets.BSKYBOT }}
           BSKYPWD: ${{ secrets.BSKYPWD }}
+      # always(): paperbot.py saves the archive after every successful post, so
+      # even if a later post fails, the ones that went out are recorded and are
+      # not posted again on the next run.
       - name: Commit and push
+        if: always()
         uses: EndBug/add-and-commit@v9
         with:
-          add: "."
+          add: "combined.json"
           push: true
           default_author: github_actions
+      - name: Report the failure in an issue
+        if: failure()
+        run: |
+          gh label create bot-failure --color B60205 --description "posterbot run failed" || true
+          open=$(gh issue list --label bot-failure --state open --json number --jq '.[0].number // empty')
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "Failed again: $RUN_URL"
+          else
+            gh issue create --label bot-failure --title "Posterbot run failed" \
+              --body "The scheduled run failed: $RUN_URL"
+          fi
+      - name: Close the failure issue after a good run
+        if: success()
+        run: |
+          for n in $(gh issue list --label bot-failure --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Recovered: $RUN_URL"
+          done
